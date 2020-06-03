@@ -1,0 +1,79 @@
+def getRepo(String branch) {
+    def finalBranch = branch.replace('origin/', '')
+    def repo
+    switch(finalBranch) {
+        case 'master':
+            repo = 'maven-releases'
+            break
+        case 'homologacao':
+            repo = 'maven-homologacao'
+            break
+        default:
+            repo = 'maven-desenv'
+    }
+    return repo
+}
+
+def getInventory(String branch) {
+  return branch.endsWith('homologacao') ? 'Homologacao' : 'Desenvolvimento'
+}
+
+pipeline {
+    agent any
+
+    environment {
+        ARTIFACTID = readMavenPom().getArtifactId()
+        GROUPID = readMavenPom().getGroupId()
+        VERSION = readMavenPom().getVersion()
+        REPOSITORY = getRepo("${GIT_BRANCH}")
+        INVENTORY = getInventory("${GIT_BRANCH}")
+        ROCKET_TOKEN = 'us9nRmnbwdgkENRYX/8WzbpdHarMaooQt8QgjQ4qup8jfacSvzyteQvTMT5XiPWkPe'
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                rocketSend message: "Build iniciada", attachments: [[title: "#${env.BUILD_NUMBER}", titleLink: "${env.BUILD_URL}", text: "${env.JOB_NAME} - ${GIT_BRANCH}"]], rawMessage: true, webhookToken: "${ROCKET_TOKEN}"
+                withMaven(maven: 'Maven Jenkins', jdk: 'Java8') {
+                    sh 'PROFILE=filial DATA_BASE_SERVER=${DATABASE_DESENVOLVIMENTO} KAFKA_SERVER=192.168.151.85 FILIAL=34 mvn clean verify -Pdeployment'
+                }
+            }
+        }
+
+        stage('Publish') {
+            steps {
+                nexusPublisher nexusInstanceId: 'Nexus_Local', nexusRepositoryId: "${REPOSITORY}", packages: [[$class: 'MavenPackage', mavenAssetList: [[classifier: '', extension: '', filePath: "target/${ARTIFACTID}-${VERSION}.war"]], mavenCoordinate: [artifactId: "${ARTIFACTID}", groupId: "${GROUPID}", packaging: 'war', version: "${VERSION}"]]]
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                expression { GIT_BRANCH ==~/.*(desenvolvimento|homologacao)$/ }
+            }
+            steps {
+                ansibleTower(
+                    towerServer: 'AWX Local',
+                    jobTemplate: 'Deploy_back',
+                    inventory: "${INVENTORY}",
+                    extraVars: '''---
+                    servicos:
+                      - artifact_id: ${ARTIFACTID}
+                        group_id: ${GROUPID}
+                        repository: ${REPOSITORY}
+                        version: ${VERSION}
+                    '''
+                )
+            }
+        }
+    }
+
+    post {
+        success {
+            rocketSend message: "Build Finalizada", attachments: [[title: "#${env.BUILD_NUMBER}", titleLink: "${env.BUILD_URL}", text: "${env.JOB_NAME} - ${GIT_BRANCH}", color: "green"]], rawMessage: true, webhookToken: "${ROCKET_TOKEN}"
+        }
+
+        failure {
+            rocketSend message: "Falha na build", attachments: [[title: "#${env.BUILD_NUMBER}", titleLink: "${env.BUILD_URL}", text: "${env.JOB_NAME} - ${GIT_BRANCH}", color: "red"]], rawMessage: true, webhookToken: "${ROCKET_TOKEN}"
+        }
+    }
+}
